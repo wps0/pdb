@@ -1,11 +1,16 @@
+use std::cmp::min;
 use std::convert::TryInto;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::vec;
 
 pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 16;
+pub(crate) static DECODING_THREADS: u32 = 3;
+
+// TODO: ustawianie czy kompresowac per kolumna. domyslnie false dla bool i int, true dla varchar
 
 #[repr(u8)]
 enum ColumnType {
@@ -34,21 +39,6 @@ pub struct DataFileHeader {
     column_offsets: Vec<u64>,
 }
 
-pub struct DataFile {
-    header: DataFileHeader,
-    inner: File,
-}
-
-// pub struct Deserializer {
-//     reader: BufReader<File>,
-// }
-
-// pub fn build_deserializer(f: File) -> Deserializer {
-//     return Deserializer {
-//         reader: BufReader::with_capacity(BUF_CAPACITY, f),
-//     };
-// }
-
 impl ColumnSchema {
     pub fn disk_size() -> usize {
         1
@@ -71,6 +61,29 @@ impl ColumnSchema {
         };
         return ColumnSchema { ctype };
     }
+}
+
+pub struct ColumnBytes {
+    file: Arc<File>,
+    pos: u64,
+    end: u64,
+}
+
+impl Read for ColumnBytes {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let max_size = min(buf.len() as u64, self.end - self.pos) as usize;
+        if max_size == 0 {
+            return Ok(0);
+        }
+        let nread = self.file.read_at(&mut buf[..max_size], self.pos)?;
+        self.pos += nread as u64;
+        Ok(nread)
+    }
+}
+
+pub struct DataFile {
+    header: DataFileHeader,
+    inner: File,
 }
 
 impl DataFile {
@@ -131,9 +144,99 @@ impl DataFile {
     }
 }
 
-// Encoding, decoding, compression, etc. - returns decoded data as a stream of bytes.
-trait ColumnReader<T> {
-    fn len(&self) -> usize;
-    fn read_row(&self, i: u32) -> T;
-    fn read(&self, from: u32, to: u32) -> Vec<u8>;
+pub enum ColumnReader {
+    Bool(BoolColumnReader),
+    Int64(Int64ColumnReader),
+    VarChar(VarCharColumnReader),
 }
+
+pub struct BoolColumnReader {
+    // offset: u64,
+    // schema: ColumnSchema,
+    // n_rows: u64,
+    // col_size: usize,
+    decoder: zstd::stream::Decoder<'static, BufReader<ColumnBytes>>,
+    // next_row: usize,
+}
+
+pub struct BoolColumn {
+    bits: Vec<u8>,
+    len: usize,
+}
+
+impl BoolColumn {
+    pub fn new(initial_capacity: usize) -> BoolColumn {
+        BoolColumn {
+            bits: vec![0; (initial_capacity + 7) / 8],
+            len: initial_capacity,
+        }
+    }
+}
+
+impl BoolColumnReader {
+    pub fn new(column_bytes: ColumnBytes) -> std::io::Result<BoolColumnReader> {
+        let decoder = zstd::stream::Decoder::new(column_bytes)?;
+        Ok(BoolColumnReader { decoder })
+    }
+
+    fn read_batch(&mut self, nrows: usize) -> BoolColumn {
+        let mut col = BoolColumn::new(nrows);
+        self.decoder.read_exact(&mut col.bits);
+        col
+    }
+}
+
+pub struct Int64ColumnReader {}
+
+impl Int64ColumnReader {}
+
+pub struct VarCharColumn {
+    data: Vec<u8>,
+    // Prefix sums.
+    offsets: Vec<u64>,
+}
+
+impl VarCharColumn {
+    pub fn new() -> VarCharColumn {
+        VarCharColumn {
+            data: vec![],
+            offsets: vec![],
+        }
+    }
+}
+
+pub struct VarCharColumnReader {
+    decoder: zstd::stream::Decoder<'static, BufReader<ColumnBytes>>,
+}
+
+impl VarCharColumnReader {
+    pub fn new(
+        column_bytes: ColumnBytes,
+    ) -> std::io::Result<VarCharColumnReader> {
+        let decoder = zstd::stream::Decoder::new(column_bytes)?;
+        Ok(VarCharColumnReader { decoder })
+    }
+
+    fn read_batch(&mut self, nrows: usize) -> std::io::Result<VarCharColumn> {
+        let mut col = VarCharColumn::new();
+        let mut size_buf = [0; 4];
+        for _ in 0..nrows {
+            self.decoder.read_exact(&mut size_buf)?;
+            let len = u32::from_le_bytes(size_buf);
+            let offset = col.offsets.last().copied().unwrap_or(0);
+            col.data.reserve(len as usize);
+            col.offsets.push(offset);
+            self.decoder.read_exact(
+                &mut col.data[offset as usize..(offset + len as u64) as usize],
+            )?;
+        }
+        Ok(col)
+    }
+}
+
+// Encoding, decoding, compression, etc. - returns decoded data as a stream of bytes.
+// trait ColumnReader<T> {
+//     fn len(&self) -> usize;
+//     fn read_row(&self, i: u32) -> T;
+//     fn read(&self, from: u32, to: u32) -> Vec<u8>;
+// }
