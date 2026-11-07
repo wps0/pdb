@@ -1,14 +1,14 @@
 use std::cmp::min;
 use std::convert::TryInto;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
 use std::sync::Arc;
 use std::vec;
 
-pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 16;
-pub(crate) static DECODING_THREADS: u32 = 3;
+use crate::encodings::{delta_decode, vle_decode, zigzag_decode};
+
+pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 4;
 
 // TODO: ustawianie czy kompresowac per kolumna. domyslnie false dla bool i int, true dla varchar
 
@@ -135,7 +135,7 @@ impl DataFile {
 
     pub fn get_column_size(&self, i: usize) -> u64 {
         assert!(self.header.column_offsets.len() > i);
-        let next = if i == self.header.column_offsets.len() {
+        let next = if i + 1 == self.header.column_offsets.len() {
             self.header.size
         } else {
             self.header.column_offsets[i + 1]
@@ -151,12 +151,7 @@ pub enum ColumnReader {
 }
 
 pub struct BoolColumnReader {
-    // offset: u64,
-    // schema: ColumnSchema,
-    // n_rows: u64,
-    // col_size: usize,
     decoder: zstd::stream::Decoder<'static, BufReader<ColumnBytes>>,
-    // next_row: usize,
 }
 
 pub struct BoolColumn {
@@ -179,16 +174,105 @@ impl BoolColumnReader {
         Ok(BoolColumnReader { decoder })
     }
 
-    fn read_batch(&mut self, nrows: usize) -> BoolColumn {
+    fn read_batch(&mut self, nrows: usize) -> std::io::Result<BoolColumn> {
         let mut col = BoolColumn::new(nrows);
-        self.decoder.read_exact(&mut col.bits);
-        col
+        self.decoder.read_exact(&mut col.bits)?;
+        Ok(col)
     }
 }
 
-pub struct Int64ColumnReader {}
+pub struct Int64Column {
+    data: Vec<i64>,
+}
 
-impl Int64ColumnReader {}
+impl Int64Column {
+    pub fn new() -> Int64Column {
+        Int64Column { data: vec![] }
+    }
+}
+
+pub struct BufferedBytes<R> {
+    inner: R,
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl<R: Read> BufferedBytes<R> {
+    pub fn new(inner: R, capacity: usize) -> Self {
+        BufferedBytes {
+            inner,
+            buf: vec![0; capacity],
+            start: 0,
+            end: 0,
+        }
+    }
+
+    pub fn refill(&mut self, upto: usize) -> std::io::Result<()> {
+        if self.end - self.start >= upto {
+            return Ok(());
+        }
+        self.buf.copy_within(self.start..self.end, 0);
+        self.end -= self.start;
+        self.start = 0;
+        while self.end < upto {
+            let n = self.inner.read(&mut self.buf[self.end..])?;
+            if n == 0 {
+                break;
+            }
+            self.end += n;
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    pub fn start(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+
+    pub fn consume(&mut self, n: usize) {
+        assert!(self.start + n <= self.end);
+        self.start += n;
+    }
+}
+
+pub struct Int64ColumnReader {
+    column: BufferedBytes<ColumnBytes>,
+    // Last read value for delta encoding.
+    last_value: i64,
+}
+
+impl Int64ColumnReader {
+    pub fn new(
+        column_bytes: ColumnBytes,
+    ) -> std::io::Result<Int64ColumnReader> {
+        Ok(Int64ColumnReader {
+            column: BufferedBytes::new(column_bytes, BUF_CAPACITY),
+            last_value: 0,
+        })
+    }
+
+    pub fn read_batch(&mut self, nrows: usize) -> std::io::Result<Int64Column> {
+        let mut col = Int64Column::new();
+        for _ in 0..nrows {
+            // Heuristically refill when a VLE-encoded int may not be fully loaded in memory (hance 10 B).
+            self.column.refill(10)?;
+            if self.column.is_empty() {
+                return Ok(col);
+            }
+
+            let (decoded, len) = vle_decode(self.column.start());
+            let decoded = delta_decode(zigzag_decode(decoded), self.last_value);
+            self.last_value = decoded;
+            self.column.consume(len);
+            col.data.push(decoded);
+        }
+        Ok(col)
+    }
+}
 
 pub struct VarCharColumn {
     data: Vec<u8>,
@@ -223,20 +307,14 @@ impl VarCharColumnReader {
         for _ in 0..nrows {
             self.decoder.read_exact(&mut size_buf)?;
             let len = u32::from_le_bytes(size_buf);
-            let offset = col.offsets.last().copied().unwrap_or(0);
-            col.data.reserve(len as usize);
-            col.offsets.push(offset);
+            let offset = col.data.len();
+            col.data.resize(offset + len as usize, 0);
+            col.offsets.push(offset as u64);
             self.decoder.read_exact(
-                &mut col.data[offset as usize..(offset + len as u64) as usize],
+                &mut col.data
+                    [offset as usize..(offset as u64 + len as u64) as usize],
             )?;
         }
         Ok(col)
     }
 }
-
-// Encoding, decoding, compression, etc. - returns decoded data as a stream of bytes.
-// trait ColumnReader<T> {
-//     fn len(&self) -> usize;
-//     fn read_row(&self, i: u32) -> T;
-//     fn read(&self, from: u32, to: u32) -> Vec<u8>;
-// }

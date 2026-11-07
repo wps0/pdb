@@ -1,3 +1,4 @@
+mod encodings;
 mod ident;
 mod storage;
 
