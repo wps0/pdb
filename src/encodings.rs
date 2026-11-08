@@ -1,4 +1,7 @@
 use std::cmp::max;
+#[cfg(test)]
+#[path = "encodings_tests.rs"]
+mod tests;
 
 pub fn zigzag_encode(n: i64) -> u64 {
     ((n << 1) ^ (n >> 63)) as u64
