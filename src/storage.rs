@@ -1,7 +1,8 @@
 use std::cmp::min;
 use std::convert::TryInto;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::ErrorKind;
+use std::io::{BufReader, BufWriter, Error, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::vec;
@@ -16,7 +17,7 @@ use crate::encodings::{
 pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 4;
 
 // TODO: ustawianie czy kompresowac per kolumna. domyslnie false dla bool i int, true dla varchar
-
+#[derive(Clone, Copy)]
 #[repr(u8)]
 enum ColumnType {
     Unsupported = 0,
@@ -29,6 +30,18 @@ enum ColumnType {
 pub struct ColumnSchema {
     ctype: ColumnType,
     // TODO: encoding, etc.
+}
+
+impl From<u8> for ColumnSchema {
+    fn from(b: u8) -> ColumnSchema {
+        let ctype = match b {
+            1 => ColumnType::Bool,
+            2 => ColumnType::Int64,
+            3 => ColumnType::VarChar,
+            v => panic!("Unsupported enum value {v}"),
+        };
+        ColumnSchema { ctype }
+    }
 }
 
 pub struct DataFileHeader {
@@ -44,6 +57,121 @@ pub struct DataFileHeader {
     column_offsets: Vec<u64>,
 }
 
+impl DataFileHeader {
+    pub fn deserialize(buf: &[u8]) -> std::io::Result<DataFileHeader> {
+        if buf.len() < 16 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "corrupted header: should be at least 16B",
+            ));
+        }
+
+        let (size, n_cols, n_rows) =
+            Self::deserialize_sizes(buf[..16].try_into().unwrap());
+        let schema = Self::deserialize_schema(&buf[16..], n_cols as usize)?;
+        let column_offsets = Self::deserialize_column_offsets(
+            &buf[16 + n_cols as usize..],
+            n_cols as usize,
+        );
+
+        Ok(DataFileHeader {
+            size,
+            n_cols: n_cols as usize,
+            n_rows: n_rows as usize,
+            schema,
+            column_offsets,
+        })
+    }
+
+    fn deserialize_sizes(sizes: &[u8; 16]) -> (u64, u32, u32) {
+        let size = u64::from_le_bytes(sizes[0..8].try_into().unwrap());
+        let n_cols = u32::from_le_bytes(sizes[8..12].try_into().unwrap());
+        let n_rows = u32::from_le_bytes(sizes[12..16].try_into().unwrap());
+        (size, n_cols, n_rows)
+    }
+
+    fn serialize_sizes(&self, sizes: &mut [u8]) {
+        sizes[0..8].copy_from_slice(&self.size.to_le_bytes());
+        sizes[8..12].copy_from_slice(&self.n_rows.to_le_bytes());
+        sizes[12..16].copy_from_slice(&self.n_cols.to_le_bytes());
+    }
+
+    fn deserialize_schema(
+        buf: &[u8],
+        n_cols: usize,
+    ) -> std::io::Result<Vec<ColumnSchema>> {
+        if buf.len() < n_cols {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "corrupted header: too short to hold schema",
+            ));
+        }
+        let mut schema: Vec<ColumnSchema> = vec![];
+        schema.reserve(n_cols);
+        for i in 0..n_cols {
+            schema.push(ColumnSchema::from(buf[i]));
+        }
+        Ok(schema)
+    }
+
+    fn serialize_schema(&self, buf: &mut [u8]) {
+        for i in 0..self.n_cols {
+            buf[i] = u8::from(&self.schema[i]);
+        }
+    }
+
+    fn deserialize_column_offsets(buf: &[u8], n_cols: usize) -> Vec<u64> {
+        let mut offsets = vec![0; n_cols];
+        for i in 0..n_cols {
+            offsets[i] =
+                u64::from_le_bytes(buf[i * 8..(i + 1) * 8].try_into().unwrap());
+        }
+        offsets
+    }
+
+    pub fn deserialize_from_file(
+        file: &File,
+    ) -> std::io::Result<DataFileHeader> {
+        let mut sizes: [u8; 16] = [0; 16];
+        if let Err(e) = file.read_exact_at(&mut sizes, 0) {
+            return Err(e);
+        }
+        let (size, n_cols, n_rows) = Self::deserialize_sizes(&sizes);
+
+        let expected_size = n_cols + n_cols * 8;
+        let mut buf = vec![0; expected_size as usize];
+        if let Err(e) = file.read_exact_at(&mut buf, 16) {
+            return Err(e);
+        }
+        let schema = Self::deserialize_schema(&buf, n_cols as usize)?;
+        let column_offsets = Self::deserialize_column_offsets(
+            &buf[n_cols as usize..],
+            n_cols as usize,
+        );
+
+        Ok(DataFileHeader {
+            size,
+            n_cols: n_cols as usize,
+            n_rows: n_rows as usize,
+            schema,
+            column_offsets,
+        })
+    }
+
+    pub fn serialize(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.len() < self.disk_size() {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "buffer too short",
+            ));
+        }
+        self.serialize_sizes(buf);
+        self.serialize_schema(&mut buf[16..]);
+
+        Ok(self.disk_size())
+    }
+}
+
 impl ColumnSchema {
     pub fn disk_size() -> usize {
         1
@@ -56,15 +184,9 @@ impl DataFileHeader {
     }
 }
 
-impl ColumnSchema {
-    pub fn from(b: u8) -> ColumnSchema {
-        let ctype = match b {
-            1 => ColumnType::Bool,
-            2 => ColumnType::Int64,
-            3 => ColumnType::VarChar,
-            v => panic!("Unsupported enum value {v}"),
-        };
-        return ColumnSchema { ctype };
+impl From<&ColumnSchema> for u8 {
+    fn from(schema: &ColumnSchema) -> u8 {
+        schema.ctype as u8
     }
 }
 
@@ -115,48 +237,10 @@ pub struct DataFile {
 }
 
 impl DataFile {
-    pub fn from_path(path: &str) -> Result<DataFile, std::io::Error> {
+    pub fn from_path(path: &str) -> Result<DataFile, Error> {
         let file = File::open(path).unwrap();
-
-        let mut sizes: [u8; 16] = [0; 16];
-        if let Err(e) = file.read_exact_at(&mut sizes, 0) {
-            return Err(e);
-        }
-        let size = u64::from_le_bytes(sizes[0..8].try_into().unwrap());
-        let n_cols =
-            u32::from_le_bytes(sizes[8..12].try_into().unwrap()) as usize;
-        let n_rows =
-            u32::from_le_bytes(sizes[12..16].try_into().unwrap()) as usize;
-
-        let expected_size = n_cols + n_cols * 8;
-        let mut buf = vec![0; expected_size];
-        if let Err(e) = file.read_exact_at(&mut buf, 16) {
-            return Err(e);
-        }
-        let mut schema: Vec<ColumnSchema> = vec![];
-        schema.reserve(n_cols);
-        for i in 0..n_cols {
-            schema.push(ColumnSchema::from(buf[i]));
-        }
-        let mut column_offsets = vec![0; n_cols];
-        for i in 0..n_cols {
-            let base_buf_offset: usize = n_cols + i * 8;
-            column_offsets[i] = u64::from_le_bytes(
-                buf[base_buf_offset..base_buf_offset + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-        }
-
-        let header = DataFileHeader {
-            size,
-            n_cols,
-            n_rows,
-            schema,
-            column_offsets,
-        };
         return Ok(DataFile {
-            header,
+            header: DataFileHeader::deserialize_from_file(&file)?,
             inner: Arc::new(file),
         });
     }
@@ -180,10 +264,83 @@ impl DataFile {
     }
 }
 
+pub struct DataFileWriter {
+    schema: Vec<ColumnSchema>,
+    columns: Vec<Column>,
+    backing_file: Arc<File>,
+    eof_offset: u64,
+}
+
+pub enum Column {
+    Bool(BoolColumn),
+    Int64(Int64Column),
+    VarChar(VarCharColumn),
+}
+
+impl DataFileWriter {
+    pub fn new(
+        schema: Vec<ColumnSchema>,
+        backing_file: Arc<File>,
+    ) -> DataFileWriter {
+        let columns = schema
+            .iter()
+            .map(|cschema| match cschema.ctype {
+                ColumnType::Bool => Column::Bool(BoolColumn::new(0)),
+                ColumnType::Int64 => Column::Int64(Int64Column::new()),
+                ColumnType::VarChar => Column::VarChar(VarCharColumn::new()),
+                _ => unreachable!("Unsupported"),
+            })
+            .collect();
+        DataFileWriter {
+            schema,
+            columns,
+            backing_file,
+            eof_offset: 0,
+        }
+    }
+
+    fn write_file_header(&mut self) {
+        let header = DataFileHeader {
+            size: 0xdeadbeef,
+            n_cols: self.columns.len(),
+            n_rows: 0xbbadbeef,
+            schema: self.schema,
+            column_offsets: vec![0; self.schema.len()],
+        };
+        let mut buf = [0u8; 1234];
+        self.backing_file.write_all(buf)
+    }
+
+    fn write_part_header(&mut self) {}
+
+    fn write_part(&mut self) {}
+
+    pub fn flush(&mut self) -> std::io::Result<usize> {
+        if self.eof_offset == 0 {
+            // Write header
+            self.write_file_header();
+        }
+        if let Column(c) = &self.columns[0] {
+            if c.len() == 0 {
+                return Ok(0);
+            }
+        }
+        self.write_part_header();
+        self.write_part();
+        Ok(1337);
+    }
+}
+
 pub enum ColumnReader {
     Bool(BoolColumnReader),
     Int64(Int64ColumnReader),
     VarChar(VarCharColumnReader),
+}
+
+pub enum ColumnWriter {
+    Bool(BoolColumnWriter),
+    Int64(Int64ColumnWriter),
+    VarChar(VarCharColumnWriter),
 }
 
 pub struct BoolColumn {
