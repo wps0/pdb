@@ -82,8 +82,8 @@ impl Read for ColumnBytes {
 }
 
 pub struct DataFile {
-    header: DataFileHeader,
-    inner: File,
+    pub header: DataFileHeader,
+    inner: Arc<File>,
 }
 
 impl DataFile {
@@ -129,11 +129,11 @@ impl DataFile {
         };
         return Ok(DataFile {
             header,
-            inner: file,
+            inner: Arc::new(file),
         });
     }
 
-    pub fn get_column_size(&self, i: usize) -> u64 {
+    fn get_column_size(&self, i: usize) -> u64 {
         assert!(self.header.column_offsets.len() > i);
         let next = if i + 1 == self.header.column_offsets.len() {
             self.header.size
@@ -141,6 +141,14 @@ impl DataFile {
             self.header.column_offsets[i + 1]
         };
         next - self.header.column_offsets[i]
+    }
+
+    pub fn column_bytes(&self, i: usize) -> ColumnBytes {
+        ColumnBytes {
+            file: Arc::clone(&self.inner),
+            pos: self.header.column_offsets[i],
+            end: self.header.column_offsets[i] + self.get_column_size(i),
+        }
     }
 }
 
