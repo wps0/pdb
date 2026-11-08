@@ -1,12 +1,17 @@
 use std::cmp::min;
 use std::convert::TryInto;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::vec;
 
-use crate::encodings::{delta_decode, vle_decode, zigzag_decode};
+use zstd::zstd_safe::CompressionLevel;
+
+use crate::encodings::{
+    delta_decode, delta_encode, vle_decode, vle_encode, zigzag_decode,
+    zigzag_encode,
+};
 
 pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 4;
 
@@ -69,6 +74,16 @@ pub struct ColumnBytes {
     end: u64,
 }
 
+impl ColumnBytes {
+    pub fn new(file: Arc<File>) -> ColumnBytes {
+        ColumnBytes {
+            file,
+            pos: 0,
+            end: 0,
+        }
+    }
+}
+
 impl Read for ColumnBytes {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let max_size = min(buf.len() as u64, self.end - self.pos) as usize;
@@ -78,6 +93,19 @@ impl Read for ColumnBytes {
         let nread = self.file.read_at(&mut buf[..max_size], self.pos)?;
         self.pos += nread as u64;
         Ok(nread)
+    }
+}
+
+impl Write for ColumnBytes {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.file.write_at(buf, self.pos)?;
+        self.pos += n as u64;
+        self.end = self.pos;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
     }
 }
 
@@ -158,10 +186,6 @@ pub enum ColumnReader {
     VarChar(VarCharColumnReader),
 }
 
-pub struct BoolColumnReader {
-    decoder: zstd::stream::Decoder<'static, BufReader<ColumnBytes>>,
-}
-
 pub struct BoolColumn {
     bits: Vec<u8>,
     len: usize,
@@ -174,18 +198,47 @@ impl BoolColumn {
             len: initial_capacity,
         }
     }
+
+    pub fn append(&mut self, b: bool) {
+        if self.len % 8 == 0 {
+            self.bits.push(0);
+        }
+        self.bits[self.len / 8] |= (b as u8) << (7 - self.len % 8);
+        self.len += 1;
+    }
+}
+
+pub struct BoolColumnReader {
+    decoder: BufReader<ColumnBytes>,
 }
 
 impl BoolColumnReader {
-    pub fn new(column_bytes: ColumnBytes) -> std::io::Result<BoolColumnReader> {
-        let decoder = zstd::stream::Decoder::new(column_bytes)?;
-        Ok(BoolColumnReader { decoder })
+    pub fn new(column_bytes: ColumnBytes) -> BoolColumnReader {
+        BoolColumnReader {
+            decoder: BufReader::new(column_bytes),
+        }
     }
 
     fn read_batch(&mut self, nrows: usize) -> std::io::Result<BoolColumn> {
         let mut col = BoolColumn::new(nrows);
         self.decoder.read_exact(&mut col.bits)?;
         Ok(col)
+    }
+}
+
+pub struct BoolColumnWriter {
+    column: BufWriter<ColumnBytes>,
+}
+
+impl BoolColumnWriter {
+    pub fn new(column_bytes: ColumnBytes) -> BoolColumnWriter {
+        BoolColumnWriter {
+            column: BufWriter::new(column_bytes),
+        }
+    }
+
+    fn write(&mut self, column_fragment: BoolColumn) -> std::io::Result<()> {
+        self.column.write_all(&column_fragment.bits)
     }
 }
 
@@ -196,6 +249,14 @@ pub struct Int64Column {
 impl Int64Column {
     pub fn new() -> Int64Column {
         Int64Column { data: vec![] }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn append(&mut self, n: i64) {
+        self.data.push(n);
     }
 }
 
@@ -282,6 +343,38 @@ impl Int64ColumnReader {
     }
 }
 
+pub struct Int64ColumnWriter {
+    writer: BufWriter<ColumnBytes>,
+    last_value: i64,
+}
+
+impl Int64ColumnWriter {
+    pub fn new(
+        column_bytes: ColumnBytes,
+    ) -> std::io::Result<Int64ColumnWriter> {
+        Ok(Int64ColumnWriter {
+            writer: BufWriter::new(column_bytes),
+            last_value: 0,
+        })
+    }
+
+    pub fn write(
+        &mut self,
+        column_fragment: Int64Column,
+    ) -> std::io::Result<()> {
+        let mut buf = [0_u8; 10];
+        for n in column_fragment.data {
+            let n_len = vle_encode(
+                zigzag_encode(delta_encode(n, self.last_value)),
+                &mut buf,
+            );
+            self.last_value = n;
+            self.writer.write_all(&buf[..n_len])?;
+        }
+        Ok(())
+    }
+}
+
 pub struct VarCharColumn {
     data: Vec<u8>,
     // Prefix sums.
@@ -294,6 +387,23 @@ impl VarCharColumn {
             data: vec![],
             offsets: vec![],
         }
+    }
+
+    pub fn append(&mut self, bytes: &mut Vec<u8>) {
+        self.offsets.push(self.data.len() as u64);
+        self.data.append(bytes);
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn length_of(&self, idx: usize) -> usize {
+        assert!(idx < self.len());
+        if idx + 1 == self.len() {
+            return self.len() - self.offsets[idx] as usize;
+        }
+        return (self.offsets[idx + 1] - self.offsets[idx]) as usize;
     }
 }
 
@@ -324,5 +434,42 @@ impl VarCharColumnReader {
             )?;
         }
         Ok(col)
+    }
+}
+
+pub struct VarCharColumnWriter {
+    encoder: zstd::stream::AutoFinishEncoder<'static, BufWriter<ColumnBytes>>,
+}
+
+impl VarCharColumnWriter {
+    pub fn new(
+        column_bytes: ColumnBytes,
+        compression_level: CompressionLevel,
+    ) -> std::io::Result<VarCharColumnWriter> {
+        Ok(VarCharColumnWriter {
+            encoder: zstd::stream::Encoder::new(
+                BufWriter::new(column_bytes),
+                compression_level,
+            )?
+            .auto_finish(),
+        })
+    }
+
+    fn write(
+        &mut self,
+        column_fragment: &VarCharColumn,
+    ) -> std::io::Result<()> {
+        for i in 0..column_fragment.len() {
+            let len = column_fragment.length_of(i);
+            // Beginning of the string - attach the length.
+            let mut buf = [0 as u8; 10];
+            let buf_n = vle_encode(len as u64, &mut buf);
+            self.encoder.write_all(&mut buf[..buf_n])?;
+
+            let offset = column_fragment.offsets[i] as usize;
+            self.encoder
+                .write_all(&column_fragment.data[offset..offset + len])?;
+        }
+        Ok(())
     }
 }
