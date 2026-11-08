@@ -323,6 +323,58 @@ pub enum Column {
     VarChar(VarCharColumn),
 }
 
+pub trait ColumnData {
+    fn count_rows(&self) -> usize;
+    fn clear(&mut self);
+}
+
+impl ColumnData for Int64Column {
+    fn count_rows(&self) -> usize {
+        self.data.len()
+    }
+    fn clear(&mut self) {
+        self.data = Vec::new();
+    }
+}
+
+impl ColumnData for BoolColumn {
+    fn count_rows(&self) -> usize {
+        self.len
+    }
+    fn clear(&mut self) {
+        self.bits = Vec::new();
+        self.len = 0;
+    }
+}
+
+impl ColumnData for VarCharColumn {
+    fn count_rows(&self) -> usize {
+        self.offsets.len()
+    }
+    fn clear(&mut self) {
+        self.data = Vec::new();
+        self.offsets = Vec::new();
+    }
+}
+
+impl Column {
+    fn inner(&self) -> &dyn ColumnData {
+        match self {
+            Column::Bool(c) => c,
+            Column::Int64(c) => c,
+            Column::VarChar(c) => c,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ColumnData {
+        match self {
+            Column::Bool(c) => c,
+            Column::Int64(c) => c,
+            Column::VarChar(c) => c,
+        }
+    }
+}
+
 impl DataFileWriter {
     pub fn new(
         schema: Vec<ColumnSchema>,
@@ -337,12 +389,13 @@ impl DataFileWriter {
                 _ => unreachable!("Unsupported"),
             })
             .collect();
+        let eof_offset = 4 + 4 + 4 + schema.len();
         DataFileWriter {
             schema,
             columns,
             n_parts: 0,
             backing_file,
-            eof_offset: 0,
+            eof_offset,
         }
     }
 
@@ -377,6 +430,7 @@ impl DataFileWriter {
 
     // Assumes that eof_offset points at DataPartHeader.
     fn write_part(&mut self) -> std::io::Result<(usize, usize, Vec<u64>)> {
+        let n_rows = self.columns.first().map_or(0, |c| c.inner().count_rows());
         let mut offset = (self.eof_offset
             + DataPartHeader::disk_size(self.columns.len()))
             as u64;
@@ -405,14 +459,22 @@ impl DataFileWriter {
             offset = next_offset;
         }
 
-        Ok((1, 2, column_sizes))
+        let part_size = column_sizes.iter().sum::<u64>() as usize;
+        Ok((part_size, n_rows, column_sizes))
     }
 
     pub fn flush(&mut self) -> std::io::Result<usize> {
+        self.n_parts += 1;
+
         self.write_file_header();
         let (part_size, n_rows, column_sizes) = self.write_part()?;
         let hdr_size = self.write_part_header(n_rows, column_sizes)?;
         self.eof_offset += hdr_size + part_size;
+
+        for c in &mut self.columns {
+            c.inner_mut().clear();
+        }
+
         Ok(hdr_size + part_size)
     }
 }
@@ -480,7 +542,7 @@ impl BoolColumnWriter {
         }
     }
 
-    fn write(&mut self, column_fragment: BoolColumn) -> std::io::Result<()> {
+    fn write(&mut self, column_fragment: &BoolColumn) -> std::io::Result<()> {
         self.writer.write_all(&column_fragment.bits)
     }
 }
@@ -601,10 +663,10 @@ impl Int64ColumnWriter {
 
     pub fn write(
         &mut self,
-        column_fragment: Int64Column,
+        column_fragment: &Int64Column,
     ) -> std::io::Result<()> {
         let mut buf = [0_u8; 10];
-        for n in column_fragment.data {
+        for &n in &column_fragment.data {
             let n_len = vle_encode(
                 zigzag_encode(delta_encode(n, self.last_value)),
                 &mut buf,
@@ -695,10 +757,7 @@ impl VarCharColumnWriter {
         })
     }
 
-    fn write(
-        &mut self,
-        column_fragment: &VarCharColumn,
-    ) -> std::io::Result<()> {
+    fn write(mut self, column_fragment: &VarCharColumn) -> std::io::Result<()> {
         for i in 0..column_fragment.len() {
             let len = column_fragment.length_of(i);
             // Beginning of the string - attach the length.
@@ -710,7 +769,7 @@ impl VarCharColumnWriter {
             self.encoder
                 .write_all(&column_fragment.data[offset..offset + len])?;
         }
-        self.encoder.finish()?;
+        self.encoder.finish()?.flush()?;
         Ok(())
     }
 }
