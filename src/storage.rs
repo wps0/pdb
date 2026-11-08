@@ -1,12 +1,13 @@
 use std::cmp::min;
 use std::convert::TryInto;
 use std::fs::File;
-use std::io::ErrorKind;
 use std::io::{BufReader, BufWriter, Error, Read, Write};
+use std::io::{ErrorKind, Seek};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::vec;
 
+use zstd::DEFAULT_COMPRESSION_LEVEL;
 use zstd::zstd_safe::CompressionLevel;
 
 use crate::encodings::{
@@ -26,6 +27,7 @@ enum ColumnType {
     // TODO: VLE INT, jakieś encodingi
 }
 
+#[derive(Clone, Copy)]
 pub struct ColumnSchema {
     ctype: ColumnType,
     // TODO: encoding, etc.
@@ -43,14 +45,6 @@ impl From<u8> for ColumnSchema {
     }
 }
 
-pub struct DataPartHeader {
-    // Length of each column in this file. u32 in binary.
-    n_rows: usize,
-    // Size of each column block. i-th column lies at [end of data part header]
-    // + sum(column_sizes[0], ..., column_sizes[i-1]).
-    column_sizes: Vec<u64>,
-}
-
 pub struct DataFileHeader {
     // No. of parts. u32 in binary.
     n_parts: usize,
@@ -62,42 +56,45 @@ pub struct DataFileHeader {
 impl DataFileHeader {
     pub const MAGIC: [u8; 4] = *b"ISDB";
 
+    pub fn disk_size(&self) -> usize {
+        4 + 4 + 4 + self.n_cols
+    }
+
     pub fn deserialize(buf: &[u8]) -> std::io::Result<DataFileHeader> {
-        if buf.len() < 16 {
+        if buf.len() < 12 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "corrupted header: should be at least 16B",
+                "corrupted header: should be at least 12B",
             ));
         }
 
-        let (size, n_cols, n_rows) =
-            Self::deserialize_sizes(buf[..16].try_into().unwrap());
-        let schema = Self::deserialize_schema(&buf[16..], n_cols as usize)?;
-        let column_offsets = Self::deserialize_column_offsets(
-            &buf[16 + n_cols as usize..],
-            n_cols as usize,
-        );
+        let (n_parts, n_cols) =
+            Self::deserialize_sizes(buf[..12].try_into().unwrap())?;
+        let schema = Self::deserialize_schema(&buf[12..], n_cols as usize)?;
 
         Ok(DataFileHeader {
-            size,
+            n_parts: n_parts as usize,
             n_cols: n_cols as usize,
-            n_rows: n_rows as usize,
             schema,
-            column_offsets,
         })
     }
 
-    fn deserialize_sizes(sizes: &[u8; 16]) -> (u64, u32, u32) {
-        let size = u64::from_le_bytes(sizes[0..8].try_into().unwrap());
+    fn deserialize_sizes(sizes: &[u8; 12]) -> std::io::Result<(u32, u32)> {
+        if sizes[0..4] != Self::MAGIC {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "not a data file: wrong magic",
+            ));
+        }
+        let n_parts = u32::from_le_bytes(sizes[4..8].try_into().unwrap());
         let n_cols = u32::from_le_bytes(sizes[8..12].try_into().unwrap());
-        let n_rows = u32::from_le_bytes(sizes[12..16].try_into().unwrap());
-        (size, n_cols, n_rows)
+        Ok((n_parts, n_cols))
     }
 
     fn serialize_sizes(&self, sizes: &mut [u8]) {
-        sizes[0..8].copy_from_slice(&self.size.to_le_bytes());
-        sizes[8..12].copy_from_slice(&self.n_rows.to_le_bytes());
-        sizes[12..16].copy_from_slice(&self.n_cols.to_le_bytes());
+        sizes[0..4].copy_from_slice(&Self::MAGIC);
+        sizes[4..8].copy_from_slice(&(self.n_parts as u32).to_le_bytes());
+        sizes[8..12].copy_from_slice(&(self.n_cols as u32).to_le_bytes());
     }
 
     fn deserialize_schema(
@@ -124,41 +121,21 @@ impl DataFileHeader {
         }
     }
 
-    fn deserialize_column_offsets(buf: &[u8], n_cols: usize) -> Vec<u64> {
-        let mut offsets = vec![0; n_cols];
-        for i in 0..n_cols {
-            offsets[i] =
-                u64::from_le_bytes(buf[i * 8..(i + 1) * 8].try_into().unwrap());
-        }
-        offsets
-    }
-
     pub fn deserialize_from_file(
         file: &File,
     ) -> std::io::Result<DataFileHeader> {
-        let mut sizes: [u8; 16] = [0; 16];
-        if let Err(e) = file.read_exact_at(&mut sizes, 0) {
-            return Err(e);
-        }
-        let (size, n_cols, n_rows) = Self::deserialize_sizes(&sizes);
+        let mut sizes: [u8; 12] = [0; 12];
+        file.read_exact_at(&mut sizes, 0)?;
+        let (n_parts, n_cols) = Self::deserialize_sizes(&sizes)?;
 
-        let expected_size = n_cols + n_cols * 8;
-        let mut buf = vec![0; expected_size as usize];
-        if let Err(e) = file.read_exact_at(&mut buf, 16) {
-            return Err(e);
-        }
+        let mut buf = vec![0; n_cols as usize];
+        file.read_exact_at(&mut buf, 12)?;
         let schema = Self::deserialize_schema(&buf, n_cols as usize)?;
-        let column_offsets = Self::deserialize_column_offsets(
-            &buf[n_cols as usize..],
-            n_cols as usize,
-        );
 
         Ok(DataFileHeader {
-            size,
+            n_parts: n_parts as usize,
             n_cols: n_cols as usize,
-            n_rows: n_rows as usize,
             schema,
-            column_offsets,
         })
     }
 
@@ -170,21 +147,85 @@ impl DataFileHeader {
             ));
         }
         self.serialize_sizes(buf);
-        self.serialize_schema(&mut buf[16..]);
+        self.serialize_schema(&mut buf[12..]);
 
         Ok(self.disk_size())
+    }
+}
+
+pub struct DataPartHeader {
+    // Length of each column in this file. u32 in binary.
+    n_rows: usize,
+    // Size of each column block. i-th column lies at [end of data part header]
+    // + sum(column_sizes[0], ..., column_sizes[i-1]).
+    column_sizes: Vec<u64>,
+}
+
+impl DataPartHeader {
+    pub fn disk_size(n_cols: usize) -> usize {
+        4 + n_cols * 8
+    }
+
+    pub fn part_size(&self) -> usize {
+        Self::disk_size(self.column_sizes.len())
+            + self.column_sizes.iter().sum::<u64>() as usize
+    }
+
+    pub fn deserialize(
+        buf: &[u8],
+        n_cols: usize,
+    ) -> std::io::Result<DataPartHeader> {
+        if buf.len() < Self::disk_size(n_cols) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "corrupted part header: too short",
+            ));
+        }
+
+        let n_rows = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let mut column_sizes = vec![0; n_cols];
+        for i in 0..n_cols {
+            let base = 4 + i * 8;
+            column_sizes[i] =
+                u64::from_le_bytes(buf[base..base + 8].try_into().unwrap());
+        }
+        Ok(DataPartHeader {
+            n_rows,
+            column_sizes,
+        })
+    }
+
+    pub fn deserialize_from_file(
+        file: &File,
+        offset: u64,
+        n_cols: usize,
+    ) -> std::io::Result<DataPartHeader> {
+        let mut buf = vec![0; Self::disk_size(n_cols)];
+        file.read_exact_at(&mut buf, offset)?;
+        Self::deserialize(&buf, n_cols)
+    }
+
+    pub fn serialize(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let size = Self::disk_size(self.column_sizes.len());
+        if buf.len() < size {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "buffer too short",
+            ));
+        }
+        buf[0..4].copy_from_slice(&(self.n_rows as u32).to_le_bytes());
+        for i in 0..self.column_sizes.len() {
+            let start = 4 + i * 8;
+            buf[start..start + 8]
+                .copy_from_slice(&self.column_sizes[i].to_le_bytes());
+        }
+        Ok(size)
     }
 }
 
 impl ColumnSchema {
     pub fn disk_size() -> usize {
         1
-    }
-}
-
-impl DataFileHeader {
-    pub fn disk_size(&self) -> usize {
-        8 + 4 + 4 + self.n_cols * (ColumnSchema::disk_size() + 8)
     }
 }
 
@@ -271,8 +312,9 @@ impl DataFile {
 pub struct DataFileWriter {
     schema: Vec<ColumnSchema>,
     columns: Vec<Column>,
+    n_parts: usize,
     backing_file: Arc<File>,
-    eof_offset: u64,
+    eof_offset: usize,
 }
 
 pub enum Column {
@@ -298,40 +340,80 @@ impl DataFileWriter {
         DataFileWriter {
             schema,
             columns,
+            n_parts: 0,
             backing_file,
             eof_offset: 0,
         }
     }
 
-    fn write_file_header(&mut self) {
-        // let header = DataFileHeader {
-        //     size: 0xdeadbeef,
-        //     n_cols: self.columns.len(),
-        //     n_rows: 0xbbadbeef,
-        //     schema: self.schema,
-        //     column_offsets: vec![0; self.schema.len()],
-        // };
-        // let mut buf = [0u8; 1234];
-        // self.backing_file.write_all(buf)
+    fn write_file_header(&mut self) -> std::io::Result<usize> {
+        let header = DataFileHeader {
+            n_cols: self.columns.len(),
+            n_parts: self.n_parts,
+            schema: self.schema.clone(),
+        };
+        let sz = header.disk_size();
+        let mut buf = vec![0u8; sz];
+        header.serialize(&mut buf)?;
+        self.backing_file.write_all_at(&buf, 0);
+        Ok(sz)
     }
 
-    fn write_part_header(&mut self) {}
+    fn write_part_header(
+        &mut self,
+        n_rows: usize,
+        column_sizes: Vec<u64>,
+    ) -> std::io::Result<usize> {
+        let header = DataPartHeader {
+            n_rows,
+            column_sizes,
+        };
+        let size = DataPartHeader::disk_size(header.column_sizes.len());
+        let mut buf = vec![0u8; size];
+        header.serialize(&mut buf)?;
+        self.backing_file.write_all_at(&buf, self.eof_offset as u64);
+        Ok(size)
+    }
 
-    fn write_part(&mut self) {}
+    // Assumes that eof_offset points at DataPartHeader.
+    fn write_part(&mut self) -> std::io::Result<(usize, usize, Vec<u64>)> {
+        let mut offset = (self.eof_offset
+            + DataPartHeader::disk_size(self.columns.len()))
+            as u64;
+
+        self.backing_file.seek(std::io::SeekFrom::Start(offset))?;
+
+        let mut column_sizes = vec![0u64; 0];
+        for column in &mut self.columns {
+            match column {
+                Column::Bool(c) => {
+                    BoolColumnWriter::new(self.backing_file.clone()).write(c)?
+                }
+                Column::Int64(c) => {
+                    Int64ColumnWriter::new(self.backing_file.clone())?
+                        .write(c)?
+                }
+                Column::VarChar(c) => VarCharColumnWriter::new(
+                    self.backing_file.clone(),
+                    DEFAULT_COMPRESSION_LEVEL,
+                )?
+                .write(&c)?,
+            }
+
+            let next_offset = self.backing_file.stream_position()?;
+            column_sizes.push(next_offset - offset);
+            offset = next_offset;
+        }
+
+        Ok((1, 2, column_sizes))
+    }
 
     pub fn flush(&mut self) -> std::io::Result<usize> {
-        // if self.eof_offset == 0 {
-        //     // Write header
-        //     self.write_file_header();
-        // }
-        // if let Column(c) = &self.columns[0] {
-        //     if c.len() == 0 {
-        //         return Ok(0);
-        //     }
-        // }
-        // self.write_part_header();
-        // self.write_part();
-        Ok(1337)
+        self.write_file_header();
+        let (part_size, n_rows, column_sizes) = self.write_part()?;
+        let hdr_size = self.write_part_header(n_rows, column_sizes)?;
+        self.eof_offset += hdr_size + part_size;
+        Ok(hdr_size + part_size)
     }
 }
 
@@ -388,18 +470,18 @@ impl BoolColumnReader {
 }
 
 pub struct BoolColumnWriter {
-    column: BufWriter<ColumnBytes>,
+    writer: BufWriter<Arc<File>>,
 }
 
 impl BoolColumnWriter {
-    pub fn new(column_bytes: ColumnBytes) -> BoolColumnWriter {
+    pub fn new(backend: Arc<File>) -> BoolColumnWriter {
         BoolColumnWriter {
-            column: BufWriter::new(column_bytes),
+            writer: BufWriter::new(backend),
         }
     }
 
     fn write(&mut self, column_fragment: BoolColumn) -> std::io::Result<()> {
-        self.column.write_all(&column_fragment.bits)
+        self.writer.write_all(&column_fragment.bits)
     }
 }
 
@@ -505,16 +587,14 @@ impl Int64ColumnReader {
 }
 
 pub struct Int64ColumnWriter {
-    writer: BufWriter<ColumnBytes>,
+    writer: BufWriter<Arc<File>>,
     last_value: i64,
 }
 
 impl Int64ColumnWriter {
-    pub fn new(
-        column_bytes: ColumnBytes,
-    ) -> std::io::Result<Int64ColumnWriter> {
+    pub fn new(f: Arc<File>) -> std::io::Result<Int64ColumnWriter> {
         Ok(Int64ColumnWriter {
-            writer: BufWriter::new(column_bytes),
+            writer: BufWriter::new(f),
             last_value: 0,
         })
     }
@@ -599,20 +679,19 @@ impl VarCharColumnReader {
 }
 
 pub struct VarCharColumnWriter {
-    encoder: zstd::stream::AutoFinishEncoder<'static, BufWriter<ColumnBytes>>,
+    encoder: zstd::stream::Encoder<'static, BufWriter<Arc<File>>>,
 }
 
 impl VarCharColumnWriter {
     pub fn new(
-        column_bytes: ColumnBytes,
+        f: Arc<File>,
         compression_level: CompressionLevel,
     ) -> std::io::Result<VarCharColumnWriter> {
         Ok(VarCharColumnWriter {
             encoder: zstd::stream::Encoder::new(
-                BufWriter::new(column_bytes),
+                BufWriter::new(f),
                 compression_level,
-            )?
-            .auto_finish(),
+            )?,
         })
     }
 
@@ -631,6 +710,7 @@ impl VarCharColumnWriter {
             self.encoder
                 .write_all(&column_fragment.data[offset..offset + len])?;
         }
+        self.encoder.finish()?;
         Ok(())
     }
 }
