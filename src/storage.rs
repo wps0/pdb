@@ -20,7 +20,6 @@ pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 4;
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum ColumnType {
-    Unsupported = 0,
     Bool = 1,
     Int64 = 2,
     VarChar = 3,
@@ -44,20 +43,25 @@ impl From<u8> for ColumnSchema {
     }
 }
 
-pub struct DataFileHeader {
-    // Total file size.
-    size: u64,
-    // No. of columns. u32 in binary.
-    n_cols: usize,
+pub struct DataPartHeader {
     // Length of each column in this file. u32 in binary.
     n_rows: usize,
+    // Size of each column block. i-th column lies at [end of data part header]
+    // + sum(column_sizes[0], ..., column_sizes[i-1]).
+    column_sizes: Vec<u64>,
+}
 
+pub struct DataFileHeader {
+    // No. of parts. u32 in binary.
+    n_parts: usize,
+    // No. of columns. u32 in binary.
+    n_cols: usize,
     schema: Vec<ColumnSchema>,
-    // The first byte of the column header, relative to the beginning of file.
-    column_offsets: Vec<u64>,
 }
 
 impl DataFileHeader {
+    pub const MAGIC: [u8; 4] = *b"ISDB";
+
     pub fn deserialize(buf: &[u8]) -> std::io::Result<DataFileHeader> {
         if buf.len() < 16 {
             return Err(Error::new(
@@ -300,15 +304,15 @@ impl DataFileWriter {
     }
 
     fn write_file_header(&mut self) {
-        let header = DataFileHeader {
-            size: 0xdeadbeef,
-            n_cols: self.columns.len(),
-            n_rows: 0xbbadbeef,
-            schema: self.schema,
-            column_offsets: vec![0; self.schema.len()],
-        };
-        let mut buf = [0u8; 1234];
-        self.backing_file.write_all(buf)
+        // let header = DataFileHeader {
+        //     size: 0xdeadbeef,
+        //     n_cols: self.columns.len(),
+        //     n_rows: 0xbbadbeef,
+        //     schema: self.schema,
+        //     column_offsets: vec![0; self.schema.len()],
+        // };
+        // let mut buf = [0u8; 1234];
+        // self.backing_file.write_all(buf)
     }
 
     fn write_part_header(&mut self) {}
@@ -316,18 +320,18 @@ impl DataFileWriter {
     fn write_part(&mut self) {}
 
     pub fn flush(&mut self) -> std::io::Result<usize> {
-        if self.eof_offset == 0 {
-            // Write header
-            self.write_file_header();
-        }
-        if let Column(c) = &self.columns[0] {
-            if c.len() == 0 {
-                return Ok(0);
-            }
-        }
-        self.write_part_header();
-        self.write_part();
-        Ok(1337);
+        // if self.eof_offset == 0 {
+        //     // Write header
+        //     self.write_file_header();
+        // }
+        // if let Column(c) = &self.columns[0] {
+        //     if c.len() == 0 {
+        //         return Ok(0);
+        //     }
+        // }
+        // self.write_part_header();
+        // self.write_part();
+        Ok(1337)
     }
 }
 
