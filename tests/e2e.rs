@@ -5,7 +5,7 @@ use std::{
 };
 
 use pdb::storage::{
-    Column, ColumnSchema, ColumnType, DataFile, DataFileWriter, Value,
+    Column, ColumnSchema, ColumnType, DataFileReader, DataFileWriter, Value,
 };
 use tempfile::NamedTempFile;
 
@@ -56,7 +56,7 @@ fn test_writes_empty_file_with_columns_roundtrip() {
     let mut writer =
         DataFileWriter::new(schema, Arc::new(tmp.reopen().unwrap()));
     let len = writer.flush().unwrap();
-    let df = DataFile::from_path(tmp.path()).unwrap();
+    let df = DataFileReader::from_path(tmp.path()).unwrap();
 
     assert_eq!(len, 16);
     assert_eq!(df.header.n_cols, 4);

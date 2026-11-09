@@ -7,14 +7,20 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::vec;
+use std::simd::Simd;
+use std::simd::num::{SimdInt, SimdUint};
 
-use zstd::DEFAULT_COMPRESSION_LEVEL;
 use zstd::zstd_safe::CompressionLevel;
 
 use crate::encodings::{
     delta_decode, delta_encode, vle_decode, vle_decode_from_stream, vle_encode,
     zigzag_decode, zigzag_encode,
 };
+
+pub const BATCH_SIZE: usize = 1024;
+pub const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = 7;
+const I64_LANES: usize = 8;
+const U8_LANES: usize = 32;
 
 pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 4;
 
@@ -30,32 +36,42 @@ pub enum ColumnType {
 #[derive(Clone, Copy)]
 pub struct ColumnSchema {
     ctype: ColumnType,
-    // TODO: encoding, etc.
 }
 
 impl ColumnSchema {
     pub fn new(ctype: ColumnType) -> ColumnSchema {
         ColumnSchema { ctype }
     }
+
+    pub fn ctype(&self) -> ColumnType {
+        self.ctype
+    }
 }
 
-impl From<u8> for ColumnSchema {
-    fn from(b: u8) -> ColumnSchema {
+impl TryFrom<u8> for ColumnSchema {
+    type Error = Error;
+
+    fn try_from(b: u8) -> std::io::Result<ColumnSchema> {
         let ctype = match b {
             1 => ColumnType::Bool,
             2 => ColumnType::Int64,
             3 => ColumnType::VarChar,
-            v => panic!("Unsupported enum value {v}"),
+            v => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unsupported column type {v}"),
+                ));
+            }
         };
-        ColumnSchema { ctype }
+        Ok(ColumnSchema { ctype })
     }
 }
 
 pub struct DataFileHeader {
     // No. of parts. u32 in binary.
-    pub n_parts: usize,
+    n_parts: usize,
     // No. of columns. u32 in binary.
-    pub n_cols: usize,
+    n_cols: usize,
     schema: Vec<ColumnSchema>,
 }
 
@@ -64,6 +80,18 @@ impl DataFileHeader {
 
     fn disk_size(&self) -> usize {
         4 + 4 + 4 + self.n_cols
+    }
+
+    pub fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+
+    pub fn n_parts(&self) -> usize {
+        self.n_parts
+    }
+
+    pub fn schema(&self) -> &[ColumnSchema] {
+        &self.schema
     }
 
     pub fn deserialize(buf: &[u8]) -> std::io::Result<DataFileHeader> {
@@ -116,7 +144,7 @@ impl DataFileHeader {
         let mut schema: Vec<ColumnSchema> = vec![];
         schema.reserve(n_cols);
         for i in 0..n_cols {
-            schema.push(ColumnSchema::from(buf[i]));
+            schema.push(ColumnSchema::try_from(buf[i])?);
         }
         Ok(schema)
     }
@@ -276,18 +304,173 @@ impl Write for ColumnBytes {
     }
 }
 
-pub struct DataFile {
+pub struct DataFileReader {
     pub header: DataFileHeader,
+    parts: Vec<DataPartHeader>,
+    // Offset of the first column of each part (right after its part header).
+    data_part_offsets: Vec<u64>,
     inner: Arc<File>,
 }
 
-impl DataFile {
-    pub fn from_path(path: &Path) -> Result<DataFile, Error> {
-        let file = File::open(path).unwrap();
-        return Ok(DataFile {
-            header: DataFileHeader::deserialize_from_file(&file)?,
+impl DataFileReader {
+    pub fn from_path(path: &Path) -> std::io::Result<DataFileReader> {
+        let file = File::open(path)?;
+        let header = DataFileHeader::deserialize_from_file(&file)?;
+
+        let mut parts = Vec::with_capacity(header.n_parts);
+        let mut data_part_offsets = Vec::with_capacity(header.n_parts);
+        let mut offset = header.disk_size() as u64;
+        for _ in 0..header.n_parts {
+            let part = DataPartHeader::deserialize_from_file(
+                &file,
+                offset,
+                header.n_cols,
+            )?;
+            data_part_offsets
+                .push(offset + DataPartHeader::disk_size(header.n_cols) as u64);
+            offset += part.part_size() as u64;
+            parts.push(part);
+        }
+
+        return Ok(DataFileReader {
+            header,
+            parts,
+            data_part_offsets,
             inner: Arc::new(file),
         });
+    }
+
+    fn column_bytes(&self, part: usize, col: usize) -> ColumnBytes {
+        let sizes = &self.parts[part].column_sizes;
+        let start =
+            self.data_part_offsets[part] + sizes[..col].iter().sum::<u64>();
+        ColumnBytes {
+            file: Arc::clone(&self.inner),
+            pos: start,
+            end: start + sizes[col],
+        }
+    }
+
+    fn get_reader_for(
+        schema: &ColumnSchema,
+        bytes: ColumnBytes,
+    ) -> std::io::Result<ColumnReader> {
+        Ok(match schema.ctype {
+            ColumnType::Bool => {
+                ColumnReader::Bool(BoolColumnReader::new(bytes))
+            }
+            ColumnType::Int64 => {
+                ColumnReader::Int64(Int64ColumnReader::new(bytes)?)
+            }
+            ColumnType::VarChar => {
+                ColumnReader::VarChar(VarCharColumnReader::new(bytes)?)
+            }
+        })
+    }
+
+    pub fn n_rows(&self, part: usize) -> usize {
+        self.parts[part].n_rows
+    }
+
+    pub fn column_readers(
+        &self,
+        part: usize,
+    ) -> std::io::Result<Vec<ColumnReader>> {
+        let mut readers = Vec::with_capacity(self.header.n_cols);
+        for (col, schema) in self.header.schema.iter().enumerate() {
+            let bytes = self.column_bytes(part, col);
+            readers.push(Self::get_reader_for(schema, bytes)?);
+        }
+        Ok(readers)
+    }
+
+    pub fn batches(&self, batch_size: usize) -> BatchReader<'_> {
+        assert!(batch_size > 0 && batch_size % 8 == 0);
+        BatchReader {
+            file: self,
+            batch_size,
+            next_part: 0,
+            readers: vec![],
+            rows_left: 0,
+        }
+    }
+
+    pub fn rows(&self) -> RowReader<'_> {
+        self.rows_offset(0)
+    }
+
+    pub fn rows_offset(&self, offset: usize) -> RowReader<'_> {
+        let mut batches = self.batches(BATCH_SIZE);
+        let mut skip = offset;
+        while batches.next_part < self.header.n_parts
+            && skip >= self.n_rows(batches.next_part)
+        {
+            skip -= self.n_rows(batches.next_part);
+            batches.next_part += 1;
+        }
+        RowReader {
+            batches,
+            batch: vec![],
+            next_row: 0,
+            skip,
+        }
+    }
+}
+
+pub struct RowReader<'a> {
+    batches: BatchReader<'a>,
+    batch: Vec<Column>,
+    next_row: usize,
+    // Rows to left to skip before reaching the offset.
+    skip: usize,
+}
+
+impl Iterator for RowReader<'_> {
+    type Item = std::io::Result<Vec<Value>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next_row == self.batch.first().map_or(0, Column::len) {
+            match self.batches.next()? {
+                Ok(batch) => self.batch = batch,
+                Err(e) => return Some(Err(e)),
+            }
+            let n = self.batch.first().map_or(0, Column::len);
+            self.next_row = self.skip.min(n);
+            self.skip -= self.next_row;
+        }
+        let row = self.batch.iter().map(|c| c.get(self.next_row)).collect();
+        self.next_row += 1;
+        Some(Ok(row))
+    }
+}
+
+pub struct BatchReader<'a> {
+    file: &'a DataFileReader,
+    batch_size: usize,
+    next_part: usize,
+    readers: Vec<ColumnReader>,
+    rows_left: usize,
+}
+
+impl Iterator for BatchReader<'_> {
+    type Item = std::io::Result<Vec<Column>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.rows_left == 0 {
+            if self.next_part == self.file.header.n_parts {
+                return None;
+            }
+            match self.file.column_readers(self.next_part) {
+                Ok(readers) => self.readers = readers,
+                Err(e) => return Some(Err(e)),
+            }
+            self.rows_left = self.file.n_rows(self.next_part);
+            self.next_part += 1;
+        }
+        let n = self.rows_left.min(self.batch_size);
+        self.rows_left -= n;
+        let columns = self.readers.iter_mut().map(|r| r.read_batch(n));
+        Some(columns.collect())
     }
 }
 
@@ -416,6 +599,18 @@ impl Column {
             (Column::VarChar(c), Value::VarChar(mut s)) => c.append(&mut s),
             _ => panic!("value type does not match column type"),
         }
+    }
+
+    pub fn get(&self, i: usize) -> Value {
+        match self {
+            Column::Bool(c) => Value::Bool(c.get(i)),
+            Column::Int64(c) => Value::Int64(c.get(i)),
+            Column::VarChar(c) => Value::VarChar(c.get(i).to_vec()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner().count_rows()
     }
 }
 
@@ -578,6 +773,16 @@ pub enum ColumnReader {
     VarChar(VarCharColumnReader),
 }
 
+impl ColumnReader {
+    pub fn read_batch(&mut self, nrows: usize) -> std::io::Result<Column> {
+        Ok(match self {
+            ColumnReader::Bool(r) => Column::Bool(r.read_batch(nrows)?),
+            ColumnReader::Int64(r) => Column::Int64(r.read_batch(nrows)?),
+            ColumnReader::VarChar(r) => Column::VarChar(r.read_batch(nrows)?),
+        })
+    }
+}
+
 pub enum ColumnWriter {
     Bool(BoolColumnWriter),
     Int64(Int64ColumnWriter),
@@ -611,6 +816,18 @@ impl BoolColumn {
         }
         self.bits[self.len / 8] |= (b as u8) << (7 - self.len % 8);
         self.len += 1;
+    }
+
+    pub fn count_true(&self) -> usize {
+        let (head, body, tail) = self.bits.as_simd::<U8_LANES>();
+        let mut count = 0;
+        for v in body {
+            count += v.count_ones().cast::<u16>().reduce_sum() as usize;
+        }
+        for b in head.iter().chain(tail) {
+            count += b.count_ones() as usize;
+        }
+        count
     }
 }
 
@@ -647,7 +864,8 @@ impl BoolColumnWriter {
         &mut self,
         column_fragment: &BoolColumn,
     ) -> std::io::Result<()> {
-        self.writer.write_all(&column_fragment.bits)
+        self.writer.write_all(&column_fragment.bits)?;
+        self.writer.flush()
     }
 }
 
@@ -670,6 +888,24 @@ impl Int64Column {
 
     pub fn append(&mut self, n: i64) {
         self.data.push(n);
+    }
+
+    pub fn sum_from(&self, from: usize) -> i128 {
+        let (head, body, tail) = self.data[from..].as_simd::<I64_LANES>();
+        let shift = Simd::splat(32);
+        let mask = Simd::splat(0xffff_ffff);
+        let mut high = Simd::splat(0);
+        let mut low = Simd::splat(0);
+        for v in body {
+            high += v >> shift;
+            low += v & mask;
+        }
+        let mut sum =
+            ((high.reduce_sum() as i128) << 32) + low.reduce_sum() as i128;
+        for &v in head.iter().chain(tail) {
+            sum += v as i128;
+        }
+        sum
     }
 }
 
@@ -743,7 +979,10 @@ impl Int64ColumnReader {
             // Heuristically refill when a VLE-encoded int may not be fully loaded in memory (hance 10 B).
             self.column.refill(10)?;
             if self.column.is_empty() {
-                return Ok(col);
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "int64 column has fewer values",
+                ));
             }
 
             let (decoded, len) = vle_decode(self.column.start());
@@ -782,7 +1021,7 @@ impl Int64ColumnWriter {
             self.last_value = n;
             self.writer.write_all(&buf[..n_len])?;
         }
-        Ok(())
+        self.writer.flush()
     }
 }
 

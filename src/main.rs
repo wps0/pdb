@@ -1,5 +1,5 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::{OpenOptions},
     io::{Error, ErrorKind, Write},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -9,7 +9,10 @@ use std::{
 use rand::RngExt;
 
 use clap::{Parser, Subcommand};
-use pdb::storage::{ColumnSchema, ColumnType, DataFileWriter, Value};
+use pdb::storage::{
+    BATCH_SIZE, Column, ColumnSchema, ColumnType, DataFileReader,
+    DataFileWriter, Value,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -49,6 +52,23 @@ enum Command {
         /// Probability that a bool value is true.
         #[arg(long, default_value_t = 0.5)]
         true_probability: f64,
+    },
+    /// Reads the file between the provided incides in the given part.
+    Read {
+        /// Path to the data file.
+        #[arg(required = true)]
+        path: PathBuf,
+
+        #[arg(long, default_value_t = 0)]
+        part: usize,
+
+        /// Starting index in the part.
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+
+        /// Ending index in the part.
+        #[arg(long)]
+        to: Option<usize>,
     },
 }
 
@@ -124,7 +144,75 @@ fn create(path: &Path, types: &[ColumnType]) -> std::io::Result<()> {
 }
 
 fn stats(path: &Path) -> std::io::Result<()> {
+    let file = DataFileReader::from_path(path)?;
+    let n_cols = file.header.n_cols();
+    let mut sums = vec![0_i128; n_cols];
+    let mut trues = vec![0_u64; n_cols];
+    let mut ascii = vec![[0_u64; 128]; n_cols];
+    let mut n_rows = 0_u64;
+
+    for batch in file.batches(BATCH_SIZE) {
+        let batch = batch?;
+        n_rows += batch.first().map_or(0, Column::len) as u64;
+        for (col, column) in batch.iter().enumerate() {
+            match column {
+                Column::Int64(c) => sums[col] += c.sum_from(0),
+                Column::Bool(c) => trues[col] += c.count_true() as u64,
+                Column::VarChar(c) => {
+                    for i in 0..c.len() {
+                        for &b in c.get(i) {
+                            if b.is_ascii() {
+                                ascii[col][b as usize] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("rows: {n_rows}");
+    for (col, schema) in file.header.schema().iter().enumerate() {
+        match schema.ctype() {
+            ColumnType::Int64 => {
+                let mean = if n_rows == 0 {
+                    0.0
+                } else {
+                    sums[col] as f64 / n_rows as f64
+                };
+                println!("column {col} (int64): mean = {mean}");
+            }
+            ColumnType::Bool => {
+                let p = if n_rows == 0 {
+                    0.0
+                } else {
+                    trues[col] as f64 / n_rows as f64
+                };
+                println!(
+                    "column {col} (bool): binary entropy = {:.6}",
+                    binary_entropy(p)
+                );
+            }
+                        ColumnType::VarChar => {
+                let total: u64 = ascii[col].iter().sum();
+                println!("column {col} (varchar): ASCII characters = {total}");
+                for (b, &count) in ascii[col].iter().enumerate() {
+                    if count > 0 {
+                        println!("  {:?}: {count}", b as u8 as char);
+                    }
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// Binary entropy in bits of a variable that is `true` with probability `p`.
+fn binary_entropy(p: f64) -> f64 {
+    if p <= 0.0 || p >= 1.0 {
+        return 0.0;
+    }
+    -(p * p.log2() + (1.0 - p) * (1.0 - p).log2())
 }
 
 fn generate(
@@ -185,6 +273,39 @@ fn generate(
     Ok(())
 }
 
+fn read(
+    path: &Path,
+    from: usize,
+    to: Option<usize>,
+    part_idx: usize,
+) -> std::io::Result<()> {
+    let file = DataFileReader::from_path(path)?;
+    if part_idx >= file.header.n_parts() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "part {part_idx} does not exist, the file has {} parts",
+                file.header.n_parts()
+            ),
+        ));
+    }
+    let n_rows = file.n_rows(part_idx);
+    let to = to.unwrap_or(n_rows).min(n_rows);
+    let mut part_start = 0;
+    for p in 0..part_idx {
+        part_start += file.n_rows(p);
+    }
+    let mut i = from;
+    for row in file.rows_offset(part_start + from) {
+        if i >= to {
+            break;
+        }
+        println!("{i}: {:?}", row?);
+        i += 1;
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let result = match args.command {
@@ -195,6 +316,12 @@ fn main() -> ExitCode {
             rows,
             true_probability,
         } => generate(&path, rows, true_probability),
+        Command::Read {
+            path,
+            from,
+            to,
+            part
+        } => read(&path, from, to, part),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");
