@@ -35,6 +35,24 @@ pub fn vle_decode(buf: &[u8]) -> (u64, usize) {
     (n, i)
 }
 
+pub fn vle_decode_from_stream(
+    stream: &mut impl std::io::Read,
+) -> std::io::Result<u64> {
+    let mut n = 0;
+    let mut i = 0;
+    let mut has_next = true;
+    let mut byte = [0u8; 1];
+    while has_next {
+        stream.read_exact(&mut byte)?;
+        n <<= 7;
+        n += (byte[i] & 0x7f) as u64;
+        has_next = byte[0] & 0x80 == 0;
+        i += 1;
+    }
+    assert!(!has_next);
+    Ok(n)
+}
+
 pub fn delta_encode(n: i64, last_n: i64) -> i64 {
     n.wrapping_sub(last_n)
 }

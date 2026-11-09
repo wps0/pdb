@@ -12,8 +12,8 @@ use zstd::DEFAULT_COMPRESSION_LEVEL;
 use zstd::zstd_safe::CompressionLevel;
 
 use crate::encodings::{
-    delta_decode, delta_encode, vle_decode, vle_encode, zigzag_decode,
-    zigzag_encode,
+    delta_decode, delta_encode, vle_decode, vle_decode_from_stream, vle_encode,
+    zigzag_decode, zigzag_encode,
 };
 
 pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 4;
@@ -599,7 +599,7 @@ impl BoolColumn {
     }
 
     pub fn get(&self, i: usize) -> bool {
-        (self.bits[i / 8] & (7 - i % 8) as u8) != 0
+        (self.bits[i / 8] >> (7 - i % 8) as u8) & 1 != 0
     }
 
     pub fn len(&self) -> usize {
@@ -818,7 +818,7 @@ impl VarCharColumn {
     pub fn length_of(&self, idx: usize) -> usize {
         assert!(idx < self.len());
         if idx + 1 == self.len() {
-            return self.len() - self.offsets[idx] as usize;
+            return self.data.len() - self.offsets[idx] as usize;
         }
         return (self.offsets[idx + 1] - self.offsets[idx]) as usize;
     }
@@ -841,17 +841,14 @@ impl VarCharColumnReader {
         nrows: usize,
     ) -> std::io::Result<VarCharColumn> {
         let mut col = VarCharColumn::new();
-        let mut size_buf = [0; 4];
         for _ in 0..nrows {
-            self.decoder.read_exact(&mut size_buf)?;
-            let len = u32::from_le_bytes(size_buf);
+            let len = zigzag_decode(vle_decode_from_stream(&mut self.decoder)?)
+                as usize;
             let offset = col.data.len();
-            col.data.resize(offset + len as usize, 0);
+            col.data.resize(offset + len, 0);
             col.offsets.push(offset as u64);
-            self.decoder.read_exact(
-                &mut col.data
-                    [offset as usize..(offset as u64 + len as u64) as usize],
-            )?;
+            self.decoder
+                .read_exact(&mut col.data[offset..offset + len])?;
         }
         Ok(col)
     }
@@ -882,8 +879,8 @@ impl VarCharColumnWriter {
             let len = column_fragment.length_of(i);
             // Beginning of the string - attach the length.
             let mut buf = [0 as u8; 10];
-            let buf_n = vle_encode(len as u64, &mut buf);
-            self.encoder.write_all(&mut buf[..buf_n])?;
+            let buf_n = vle_encode(zigzag_encode(len as i64), &mut buf);
+            self.encoder.write_all(&buf[..buf_n])?;
 
             let offset = column_fragment.offsets[i] as usize;
             self.encoder
