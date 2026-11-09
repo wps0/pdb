@@ -9,7 +9,7 @@ make clean
 
 Statistics for a file (INT64 mean, BOOL binary entropy, ASCII character count in VARCHAR):
 ```sh
-cargo run resources/file1.isbd
+cargo run -- stats resources/file1.isbd
 ```
 
 ## File format
@@ -29,3 +29,4 @@ A batch is a set of columns: INT64 `Vec<i64>`, BOOL bitmap `Vec<u8>`, VARCHAR `d
 
 ## Future plans
 * Rework the src in Tokio to support parallel data fetching
+* Support different compression methods and encodings switchable per column by storing encoding information in ColumnSchema.

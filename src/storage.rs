@@ -18,8 +18,7 @@ use crate::encodings::{
 
 pub(crate) static BUF_CAPACITY: usize = 1024 * 1024 * 4;
 
-// TODO: ustawianie czy kompresowac per kolumna. domyslnie false dla bool i int, true dla varchar
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 pub enum ColumnType {
     Bool = 1,
