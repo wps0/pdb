@@ -45,9 +45,8 @@ pub fn vle_decode_from_stream(
         stream.read_exact(&mut byte)?;
         n <<= 7;
         n += (byte[0] & 0x7f) as u64;
-        has_next = byte[0] & 0x80 == 0;
+        has_next = byte[0] & 0x80 != 0;
     }
-    assert!(!has_next);
     Ok(n)
 }
 
