@@ -5,7 +5,7 @@ use std::{
 };
 
 use pdb::storage::{
-    Column, ColumnSchema, ColumnType, DataFile, DataFileWriter,
+    Column, ColumnSchema, ColumnType, DataFile, DataFileWriter, Value,
 };
 use tempfile::NamedTempFile;
 
@@ -126,7 +126,13 @@ fn test_each_flush_appends_part_and_resets_delta() {
         0x0e, // 7 -> delta 7 -> zigzag 14
         0b1000_0000, // true
     ];
+    let [row0, row1, row2] = [
+        vec![Value::from(5), Value::from(false)],
+        vec![Value::from(6), Value::from(true)],
+        vec![Value::from(7), Value::from(true)],
+    ];
     let mut tmp = unnamed_file();
+
     let mut writer = DataFileWriter::new(
         vec![
             ColumnSchema::new(ColumnType::Int64),
@@ -134,24 +140,11 @@ fn test_each_flush_appends_part_and_resets_delta() {
         ],
         tmp.clone(),
     );
-
-    for (ints, bools) in
-        [(vec![5, 6], vec![false, true]), (vec![7], vec![true])]
-    {
-        let Column::Int64(c) = &mut writer.columns_mut()[0] else {
-            panic!()
-        };
-        for v in ints {
-            c.append(v);
-        }
-        let Column::Bool(c) = &mut writer.columns_mut()[1] else {
-            panic!()
-        };
-        for b in bools {
-            c.append(b);
-        }
-        writer.flush().unwrap();
-    }
+    writer.append_row(row0).unwrap();
+    writer.append_row(row1).unwrap();
+    writer.flush().unwrap();
+    writer.append_row(row2).unwrap();
+    writer.flush().unwrap();
 
     assert_eq!(dump_from_readable(&mut tmp).unwrap(), expected);
 }

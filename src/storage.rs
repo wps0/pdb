@@ -292,6 +292,49 @@ impl DataFile {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Bool(bool),
+    Int64(i64),
+    VarChar(Vec<u8>),
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Value {
+        Value::Bool(b)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(n: i64) -> Value {
+        Value::Int64(n)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Value {
+        Value::VarChar(s.as_bytes().to_vec())
+    }
+}
+
+impl From<&[u8]> for Value {
+    fn from(s: &[u8]) -> Value {
+        Value::VarChar(s.to_vec())
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(s: Vec<u8>) -> Value {
+        Value::VarChar(s)
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Value {
+        Value::VarChar(s.into_bytes())
+    }
+}
+
 pub struct DataFileWriter {
     schema: Vec<ColumnSchema>,
     columns: Vec<Column>,
@@ -357,6 +400,24 @@ impl Column {
             Column::VarChar(c) => c,
         }
     }
+
+    fn accepts(&self, value: &Value) -> bool {
+        matches!(
+            (self, value),
+            (Column::Bool(_), Value::Bool(_))
+                | (Column::Int64(_), Value::Int64(_))
+                | (Column::VarChar(_), Value::VarChar(_))
+        )
+    }
+
+    pub fn push(&mut self, value: Value) {
+        match (self, value) {
+            (Column::Bool(c), Value::Bool(b)) => c.append(b),
+            (Column::Int64(c), Value::Int64(n)) => c.append(n),
+            (Column::VarChar(c), Value::VarChar(mut s)) => c.append(&mut s),
+            _ => panic!("value type does not match column type"),
+        }
+    }
 }
 
 impl DataFileWriter {
@@ -370,7 +431,6 @@ impl DataFileWriter {
                 ColumnType::Bool => Column::Bool(BoolColumn::new(0)),
                 ColumnType::Int64 => Column::Int64(Int64Column::new()),
                 ColumnType::VarChar => Column::VarChar(VarCharColumn::new()),
-                _ => unreachable!("Unsupported"),
             })
             .collect();
         let eof_offset = 4 + 4 + 4 + schema.len();
@@ -477,6 +537,39 @@ impl DataFileWriter {
 
     pub fn columns_mut(&mut self) -> &mut [Column] {
         &mut self.columns
+    }
+
+    fn validate_append_row(&self, row: &[Value]) -> std::io::Result<()> {
+        if row.len() != self.columns.len() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "wrong number of values in row",
+            ));
+        }
+        if !self.columns.iter().zip(row).all(|(c, v)| c.accepts(v)) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "row does not match the schema",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn append_row(&mut self, row: Vec<Value>) -> std::io::Result<()> {
+        self.validate_append_row(&row)?;
+        for (column, value) in self.columns.iter_mut().zip(row) {
+            column.push(value);
+        }
+        Ok(())
+    }
+
+    pub fn append_row_ref(&mut self, row: &[Value]) -> std::io::Result<()> {
+        self.validate_append_row(row)?;
+        for (column, value) in self.columns.iter_mut().zip(row.iter().cloned())
+        {
+            column.push(value);
+        }
+        Ok(())
     }
 }
 
