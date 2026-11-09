@@ -474,7 +474,7 @@ impl Iterator for BatchReader<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Value {
     Bool(bool),
     Int64(i64),
@@ -514,6 +514,16 @@ impl From<Vec<u8>> for Value {
 impl From<String> for Value {
     fn from(s: String) -> Value {
         Value::VarChar(s.into_bytes())
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Int64(n) => write!(f, "{n}"),
+            Value::VarChar(s) => write!(f, "{:?}", String::from_utf8_lossy(s)),
+        }
     }
 }
 
