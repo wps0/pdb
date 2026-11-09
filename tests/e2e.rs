@@ -90,7 +90,7 @@ fn test_second_empty_flush_writes_nothing() {
     let expected = vec![
         b'I', b'S', b'D', b'B', // magic
         0, 0, 0, 0, // n_parts = 0
-        1, 0, 0, 0, // n_cols = 4
+        1, 0, 0, 0, // n_cols = 1
         2, // schema: Int64
     ];
     let mut tmp = unnamed_file();
