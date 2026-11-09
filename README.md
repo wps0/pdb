@@ -9,7 +9,7 @@ make clean
 
 Statistics for a file (INT64 mean, BOOL binary entropy, ASCII character count in VARCHAR):
 ```sh
-cargo run -- stats resources/file1.isbd
+cargo run -- stats resources/pan-tadeusz.isbd
 ```
 
 ## File format
