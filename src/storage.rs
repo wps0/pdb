@@ -474,6 +474,10 @@ impl DataFileWriter {
 
         Ok(file_header_size + hdr_size + part_size)
     }
+
+    pub fn columns_mut(&mut self) -> &mut [Column] {
+        &mut self.columns
+    }
 }
 
 pub enum ColumnReader {
@@ -499,6 +503,14 @@ impl BoolColumn {
             bits: vec![0; (initial_capacity + 7) / 8],
             len: initial_capacity,
         }
+    }
+
+    pub fn get(&self, i: usize) -> bool {
+        (self.bits[i / 8] & (7 - i % 8) as u8) != 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     pub fn append(&mut self, b: bool) {
@@ -554,6 +566,10 @@ pub struct Int64Column {
 impl Int64Column {
     pub fn new() -> Int64Column {
         Int64Column { data: vec![] }
+    }
+
+    pub fn get(&self, i: usize) -> i64 {
+        self.data[i]
     }
 
     pub fn len(&self) -> usize {
@@ -695,6 +711,11 @@ impl VarCharColumn {
     pub fn append(&mut self, bytes: &mut Vec<u8>) {
         self.offsets.push(self.data.len() as u64);
         self.data.append(bytes);
+    }
+
+    pub fn get(&self, i: usize) -> &[u8] {
+        let base = self.offsets[i] as usize;
+        &self.data[base..base + self.length_of(i)]
     }
 
     pub fn len(&self) -> usize {
