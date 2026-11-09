@@ -5,9 +5,10 @@ use std::{
 };
 
 use pdb::storage::{
-    Column, ColumnSchema, ColumnType, DataFileReader, DataFileWriter, Value,
+    ColumnSchema, ColumnType, DataFileReader, DataFileWriter, Value,
 };
 use tempfile::NamedTempFile;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 fn unnamed_file() -> Arc<File> {
     Arc::new(tempfile::tempfile().unwrap())
@@ -59,8 +60,8 @@ fn test_writes_empty_file_with_columns_roundtrip() {
     let df = DataFileReader::from_path(tmp.path()).unwrap();
 
     assert_eq!(len, 16);
-    assert_eq!(df.header.n_cols, 4);
-    assert_eq!(df.header.n_parts, 0);
+    assert_eq!(df.header.n_cols(), 4);
+    assert_eq!(df.header.n_parts(), 0);
 }
 
 #[test]
@@ -147,4 +148,69 @@ fn test_each_flush_appends_part_and_resets_delta() {
     writer.flush().unwrap();
 
     assert_eq!(dump_from_readable(&mut tmp).unwrap(), expected);
+}
+
+/// Random value of the given type.
+fn random_value(rng: &mut impl RngExt, ctype: ColumnType) -> Value {
+    const ALPHABET: [char; 5] = ['a', 'b', '2', '3', '\0'];
+    match ctype {
+        ColumnType::Bool => Value::from(rng.random_bool(0.5)),
+        ColumnType::Int64 => {
+            Value::from(rng.random_range(0..=2_000_000) as i64 - 1_000_000)
+        }
+        ColumnType::VarChar => {
+            let len = rng.random_range(0..=30);
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push(ALPHABET[rng.random_range(0..=ALPHABET.len() - 1)]);
+            }
+            Value::from(s)
+        }
+    }
+}
+
+#[test]
+fn test_random_roundtrip() {
+    let types = [ColumnType::Bool, ColumnType::Int64, ColumnType::VarChar];
+    let mut rng = StdRng::seed_from_u64(4);
+    for test in 0..100 {
+        // given
+        let n_cols = rng.random_range(1..=5);
+        let mut ctypes = vec![];
+        let mut schema = vec![];
+        for _ in 0..n_cols {
+            let ctype = types[rng.random_range(0..=types.len() - 1)];
+            ctypes.push(ctype);
+            schema.push(ColumnSchema::new(ctype));
+        }
+        let tmp = Arc::new(tempfile::tempfile().unwrap());
+        let mut writer = DataFileWriter::new(schema, Arc::clone(&tmp));
+        let n_rows = rng.random_range(0..=3000);
+        let mut rows = vec![];
+        for _ in 0..n_rows {
+            let mut row = vec![];
+            for &ctype in &ctypes {
+                row.push(random_value(&mut rng, ctype));
+            }
+            writer.append_row_ref(&row).unwrap();
+            rows.push(row);
+            // Ends the part at random, so that parts have random sizes.
+            if rng.random_bool(0.001) {
+                writer.flush().unwrap();
+            }
+        }
+        writer.flush().unwrap();
+
+        // when
+        let file =
+            DataFileReader::from_file(tmp.try_clone().unwrap()).unwrap();
+        let read_rows: Vec<Vec<Value>> =
+            file.rows().collect::<std::io::Result<_>>().unwrap();
+
+        // then
+        assert_eq!(read_rows.len(), rows.len(), "test {test}");
+        for i in 0..rows.len() {
+            assert_eq!(read_rows[i], rows[i], "test {test}, row {i}");
+        }
+    }
 }

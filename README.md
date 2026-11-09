@@ -1,4 +1,4 @@
-# pdb: columnar file format (ISBD, project 2)
+# pdb - ISBD project
 
 ## Build and run
 ```sh
@@ -7,7 +7,7 @@ make test
 make clean
 ```
 
-Statistics for a file (INT64 mean, BOOL binary entropy, ASCII character count in VARCHAR):
+Statistics for a file (INT64 mean, BOOL binary entropy, ASCII characters in VARCHARs):
 ```sh
 cargo run -- stats resources/pan-tadeusz.isbd
 ```

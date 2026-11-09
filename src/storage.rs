@@ -314,7 +314,10 @@ pub struct DataFileReader {
 
 impl DataFileReader {
     pub fn from_path(path: &Path) -> std::io::Result<DataFileReader> {
-        let file = File::open(path)?;
+        Self::from_file(File::open(path)?)
+    }
+
+    pub fn from_file(file: File) -> std::io::Result<DataFileReader> {
         let header = DataFileHeader::deserialize_from_file(&file)?;
 
         let mut parts = Vec::with_capacity(header.n_parts);
